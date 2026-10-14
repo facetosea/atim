@@ -5256,13 +5256,35 @@ impl Server {
             }
         }
 
+        // Ask tmux once which windows still exist rather than capturing each
+        // binding in turn. Bindings outlive their windows — a window closed
+        // outside atim, a session that went away — and every stale one costs a
+        // tmux invocation that can only fail.
+        //
+        // `list_all_windows` rather than `list_windows`: a bound window is not
+        // necessarily in the atim session (find_window_by_name moves foreign
+        // windows in, and a binding can predate that).
+        let live: HashSet<String> = match self.tmux_mgr.list_all_windows().await {
+            Ok(windows) => windows.into_iter().map(|(w, _)| w.window_id.0).collect(),
+            Err(e) => {
+                tracing::debug!("[probe] Could not list windows, skipping this cycle: {e}");
+                return Ok(());
+            }
+        };
+        let bound = bindings.len();
+        bindings.retain(|(_, wb)| live.contains(&wb.window_id));
+        if let Some(stale) = bound.checked_sub(bindings.len()).filter(|n| *n > 0) {
+            tracing::debug!("[probe] Skipped {stale} binding(s) whose window tmux no longer has");
+        }
+
         tracing::debug!("[probe] Probing {} windows", bindings.len());
 
         for (cb, wb) in bindings.into_iter().rev() {
             let wid = WindowId(wb.window_id.clone());
             let pane_text = match self.tmux_mgr.capture_pane(&wid).await {
                 Ok(t) => t,
-                Err(_) => continue, // window gone
+                // Closed between the listing above and here.
+                Err(_) => continue,
             };
 
             // Strip ANSI
