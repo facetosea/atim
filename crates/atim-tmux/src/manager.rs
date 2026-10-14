@@ -95,9 +95,7 @@ impl TmuxManager {
 
     /// Run `tmux` with the given args and return stdout as a String.
     ///
-    /// Automatically recovers from a dead tmux server: if the server socket
-    /// is stale ("no server running"), creates a new session and retries.
-    /// Also retries transient EIO errors (e.g. an underlying disk hiccup on
+    /// Retries transient EIO errors (e.g. an underlying disk hiccup on
     /// a mounted filesystem) so a single glitch doesn't fail the operation.
     async fn tmux(&self, args: &[&str]) -> Result<String> {
         const MAX_EIO_RETRIES: u32 = 3;
@@ -116,7 +114,6 @@ impl TmuxManager {
                         msg
                     );
                     tokio::time::sleep(Duration::from_millis(500 * eio_attempt as u64)).await;
-                    // Skip the dead-server recovery path for EIO — just retry.
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -124,7 +121,7 @@ impl TmuxManager {
         }
     }
 
-    /// Execute one tmux command, including the dead-server recovery path.
+    /// Execute one tmux command.
     async fn tmux_once(&self, args: &[&str]) -> Result<String> {
         let output = Command::new(&self.binary)
             .args(args)
@@ -136,43 +133,29 @@ impl TmuxManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let err_msg = format!("tmux {} failed: {stderr}", args.join(" "));
 
-            // Recover from a dead tmux server
-            if stderr.contains("no server running") {
-                tracing::warn!(
-                    "tmux server not running, re-creating session \"{}\"",
-                    self.session_name
-                );
-                let _ = Command::new(&self.binary)
-                    .args(["new-session", "-d", "-s", &self.session_name])
-                    .output()
-                    .await;
-                // Retry the original command
-                let retry = Command::new(&self.binary)
-                    .args(args)
-                    .output()
-                    .await
-                    .map_err(|e| Error::Tmux(format!("failed to execute {}: {e}", self.binary)))?;
-                if retry.status.success() {
-                    return Ok(String::from_utf8_lossy(&retry.stdout).to_string());
-                }
-                let retry_stderr = String::from_utf8_lossy(&retry.stderr);
-                return Err(Error::Tmux(format!(
-                    "tmux {} failed (after server restart): {retry_stderr}",
-                    args.join(" ")
-                )));
-            }
-
             return Err(Error::Tmux(err_msg));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    async fn send_keys(&self, args: &[&str]) -> Result<()> {
+        for attempt in 0..=3 {
+            match self.tmux(args).await {
+                Err(Error::Tmux(msg)) if msg.contains("no current client") && attempt < 3 => {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                result => return result.map(|_| ()),
+            }
+        }
+        unreachable!()
+    }
+
     // ── Window listing ──
 
     /// List all windows in the session.
     ///
-    /// Returns `Ok(vec![])` if the session does not exist (no error).
+    /// Returns an error if the session does not exist.
     pub async fn list_windows(&self) -> Result<Vec<WindowInfo>> {
         let out = self
             .tmux(&[
@@ -247,6 +230,29 @@ impl TmuxManager {
     /// placement hits an "index in use" conflict (e.g. from leftover
     /// windows of a previous run).
     pub async fn new_window(&self, name: &str, cwd: &str) -> Result<WindowId> {
+        if !self.session_exists().await {
+            match self
+                .tmux(&[
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &self.session_name,
+                    "-n",
+                    name,
+                    "-c",
+                    cwd,
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                ])
+                .await
+            {
+                Ok(out) => return Ok(WindowId(out.trim().to_string())),
+                // Another request may have created the session after our probe.
+                Err(Error::Tmux(msg)) if msg.contains("duplicate session") => {}
+                Err(e) => return Err(e),
+            }
+        }
         let result = self
             .tmux(&[
                 "new-window",
@@ -271,6 +277,24 @@ impl TmuxManager {
                         "new-window",
                         "-a",
                         "-t",
+                        &self.session_name,
+                        "-n",
+                        name,
+                        "-c",
+                        cwd,
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                    ])
+                    .await?;
+                Ok(WindowId(out.trim().to_string()))
+            }
+            Err(Error::Tmux(msg)) if msg.contains("no server running") => {
+                let out = self
+                    .tmux(&[
+                        "new-session",
+                        "-d",
+                        "-s",
                         &self.session_name,
                         "-n",
                         name,
@@ -326,16 +350,10 @@ impl TmuxManager {
     /// chunk to the pane's input line, so the agent still receives the full
     /// text in one input.
     pub async fn send_text(&self, window_id: &WindowId, text: &str) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.0);
         for (start, end) in chunk_ranges(text, self.send_chunk) {
-            self.tmux(&[
-                "send-keys",
-                "-t",
-                &window_id.0,
-                "-l",
-                "--",
-                &text[start..end],
-            ])
-            .await?;
+            self.send_keys(&["send-keys", "-t", &target, "-l", "--", &text[start..end]])
+                .await?;
         }
         Ok(())
     }
@@ -348,13 +366,14 @@ impl TmuxManager {
     /// named key "Escape" as visible text instead of sending the actual key.
     /// All other key names are sent via tmux's named-key protocol.
     pub async fn send_key(&self, window_id: &WindowId, key: &str) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.0);
         if key == "Escape" {
             // Send literal ESC byte (0x1B) via send-keys -l to avoid
             // psmux rendering "Escape" as visible text.
-            self.tmux(&["send-keys", "-t", &window_id.0, "-l", "\x1b"])
+            self.send_keys(&["send-keys", "-t", &target, "-l", "\x1b"])
                 .await?;
         } else {
-            self.tmux(&["send-keys", "-t", &window_id.0, key]).await?;
+            self.send_keys(&["send-keys", "-t", &target, key]).await?;
         }
         Ok(())
     }
@@ -382,10 +401,11 @@ impl TmuxManager {
         text: &str,
         char_delay_ms: u64,
     ) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.0);
         for c in text.chars() {
             let mut buf = [0u8; 4];
             let s: &str = c.encode_utf8(&mut buf);
-            self.tmux(&["send-keys", "-t", &window_id.0, "-l", s])
+            self.send_keys(&["send-keys", "-t", &target, "-l", s])
                 .await?;
             if char_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(char_delay_ms)).await;

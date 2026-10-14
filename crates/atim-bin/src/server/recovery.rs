@@ -151,6 +151,12 @@ impl super::Server {
         // Re-resolve thread_id from the found binding (card actions use
         // chat-derived thread_id which may differ from the binding's thread_id).
         let thread_id = cb.thread_id;
+        // The callback has already removed this message from the queue.
+        // Keep it until the recovered agent has accepted the send.
+        self.pending_messages
+            .lock()
+            .await
+            .insert((user_id, thread_id), text.to_string());
 
         // Resolve session info from window_binding or session store
         let old_window_id: String;
@@ -260,19 +266,36 @@ impl super::Server {
 
         // Create new tmux window
         let window_name = &cb.display_name;
-        let new_window_id = self.tmux_mgr.new_window(window_name, &cwd).await?;
-
-        // Launch agent (resume if we have a session_id)
-        if !session_id.is_empty() && agent.supports_sessions() {
-            if let Some(resume_cmd) = agent.resume_command(&session_id) {
-                self.tmux_mgr.send_line(&new_window_id, &resume_cmd).await?;
-            } else {
-                let launch_cmd = agent_launch_cmd(&agent);
-                self.tmux_mgr.send_line(&new_window_id, &launch_cmd).await?;
+        let new_window_id = match self.tmux_mgr.new_window(window_name, &cwd).await {
+            Ok(window_id) => window_id,
+            Err(e) => {
+                tracing::warn!("[recover] Failed to create window: {e}");
+                let _ = self
+                    .im_adapter
+                    .edit_message(target, msg_id, "Could not create a tmux window. The pending message was retained; retry recovery after tmux is available.")
+                    .await;
+                return Ok(());
             }
+        };
+
+        // Launch agent (resume only when this agent supports that session).
+        let resume_cmd = if session_id.is_empty() {
+            None
         } else {
-            let launch_cmd = agent_launch_cmd(&agent);
-            self.tmux_mgr.send_line(&new_window_id, &launch_cmd).await?;
+            agent.resume_command(&session_id)
+        };
+        let resumes_session = resume_cmd.is_some();
+        let launch_cmd = resume_cmd.unwrap_or_else(|| agent_launch_cmd(&agent));
+        if let Err(e) = self.tmux_mgr.send_line(&new_window_id, &launch_cmd).await {
+            tracing::warn!(
+                "[recover] Failed to launch agent in {}: {e}",
+                new_window_id.0
+            );
+            let _ = self
+                .im_adapter
+                .edit_message(target, msg_id, "Agent could not be started. The pending message was retained; start the agent in the recovered window, then send `/rebind`.")
+                .await;
+            return Ok(());
         }
 
         // Wait for agent process to start
@@ -337,7 +360,7 @@ impl super::Server {
             rt.window_bindings.remove(&old_window_id);
         }
 
-        let new_session_id: String = if !session_id.is_empty() && agent.supports_sessions() {
+        let new_session_id: String = if resumes_session {
             session_id.clone()
         } else {
             String::new()
@@ -354,11 +377,10 @@ impl super::Server {
             },
         );
 
-        if !new_session_id.is_empty()
-            && let Some(cb) = rt
-                .chat_bindings
-                .iter_mut()
-                .find(|cb| cb.user_id == user_id && cb.thread_id == thread_id)
+        if let Some(cb) = rt
+            .chat_bindings
+            .iter_mut()
+            .find(|cb| cb.user_id == user_id && cb.thread_id == thread_id)
         {
             cb.session_id = new_session_id.clone();
         }
@@ -419,6 +441,12 @@ impl super::Server {
                 if let Err(e) = self.state_mgr.save_session_map(&map).await {
                     tracing::warn!("[recover/fresh] Failed to save session_map: {e}");
                 }
+            } else if agent.name() != "copilot" {
+                let _ = self
+                    .im_adapter
+                    .edit_message(target, msg_id, "Session ID could not be found. Send `/rebind` to forward the pending message.")
+                    .await;
+                return Ok(());
             }
         }
 
@@ -437,6 +465,10 @@ impl super::Server {
         } else {
             self.tmux_mgr.send_line(&new_window_id, text).await?;
         }
+        self.pending_messages
+            .lock()
+            .await
+            .remove(&(user_id, thread_id));
 
         let sc_chat_id = cb.group_chat_id.unwrap_or(cb.chat_id);
         self.status_consumed

@@ -160,13 +160,34 @@ const MAX_MSG_LEN: usize = 3800;
 /// giving `enqueue_session_output` a defined overflow point.
 const OUTBOUND_QUEUE_CAP: usize = 256;
 
-/// Pre-compiled regex for extracting the Session ID from `/status` output.
+/// Match Claude's `Session ID:` and Codex's `Session:` status fields.
 static SESSION_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"Session ID:\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        r"(?m)^[ \t]*(?:[│|][ \t]*)?Session(?: ID)?:[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[ \t]*[│|])?[ \t]*$",
     )
     .expect("SESSION_ID_RE is valid")
 });
+
+/// A status modal can redraw the pane instead of appending lines, so compare
+/// rendered lines rather than their positions in the capture.
+fn session_id_from_status_capture(before: &str, after: &str) -> Option<String> {
+    let mut old_lines = std::collections::HashMap::<&str, usize>::new();
+    for line in before.lines().map(str::trim) {
+        *old_lines.entry(line).or_default() += 1;
+    }
+    after
+        .lines()
+        .map(str::trim)
+        .filter(|line| match old_lines.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .filter_map(|line| SESSION_ID_RE.captures(line).map(|c| c[1].to_string()))
+        .last()
+}
 
 impl Server {
     /// Generate a short callback context token and store the validation context.
@@ -489,6 +510,9 @@ impl Server {
         // Filter and group messages by session_id
         let mut by_session: HashMap<String, Vec<&atim_core::message::NewMessage>> = HashMap::new();
         for msg in &messages {
+            if msg.session_id.0.is_empty() {
+                continue;
+            }
             tracing::debug!(
                 "[pipe] NewMessage: session_id={}, role={}, content_type={:?}, complete={}, text_len={}",
                 msg.session_id.0,
@@ -522,7 +546,7 @@ impl Server {
 
         for (_sid, group) in &by_session {
             // Resolve to chat binding by session_id directly (V2)
-            let binding = match rt.chat_bindings.iter().find(|cb| cb.session_id == *_sid) {
+            let binding = match rt.chat_bindings.iter().rfind(|cb| cb.session_id == *_sid) {
                 Some(cb) => cb.clone(),
                 None => {
                     tracing::warn!(
@@ -533,6 +557,11 @@ impl Server {
                     continue;
                 }
             };
+
+            if !rt.window_bindings.values().any(|wb| wb.session_id == *_sid) {
+                tracing::warn!("[pipe] Skipping session_id={_sid}: no matching window binding");
+                continue;
+            }
 
             let chat_id = binding.group_chat_id.unwrap_or(binding.chat_id);
             let thread_id_val = binding.thread_id;
@@ -1741,11 +1770,39 @@ impl Server {
 
         // Handle /rebind — detect running agent and session, then (re)bind exclusively
         if text.trim() == "/rebind" {
-            if let Some((binding, _wb_opt)) = find_cb() {
-                // Find the tmux window by matching the display_name (window name)
-                // rather than relying on stale session-based bindings.
-                // Fall back to target.chat_name if display_name is stale.
-                let wid_str = match self.find_window_by_name(&binding.display_name).await {
+            if let Some((binding, wb_opt)) = find_cb() {
+                // The stored window ID survives a chat rename. Verify that it
+                // still belongs to our session before falling back to names.
+                let provisional = if binding.session_id.is_empty() {
+                    let mut matches = rt.window_bindings.values().filter(|wb| {
+                        wb.session_id.is_empty() && wb.window_name == binding.display_name
+                    });
+                    let first = matches.next();
+                    if matches.next().is_none() {
+                        first
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let stored_window = if let Some(wb) = wb_opt.or(provisional) {
+                    let wid = WindowId(wb.window_id.clone());
+                    self.tmux_mgr
+                        .find_window(&wid)
+                        .await
+                        .ok()
+                        .filter(|info| info.window_id == wid)
+                        .map(|_| wid.0)
+                } else {
+                    None
+                };
+                let window_by_name = if stored_window.is_none() {
+                    self.find_window_by_name(&binding.display_name).await
+                } else {
+                    None
+                };
+                let wid_str = match stored_window.or(window_by_name) {
                     Some(wid) => wid,
                     None => {
                         // Try the IM chat_name as fallback — display_name may be stale
@@ -1856,13 +1913,12 @@ impl Server {
                             .ok()
                             .unwrap_or_default();
                         let baseline = strip_ansi(&baseline_raw);
-                        let baseline_len = baseline.lines().count();
 
-                        // Send /status to Claude Code
+                        // Send /status to the running agent.
                         self.tmux_mgr.send_line(&window_id, "/status").await.ok();
                         tokio::time::sleep(Duration::from_millis(2000)).await;
 
-                        // Capture updated pane, strip ANSI, then extract Session ID.
+                        // Accept only a status line newly rendered by this command.
                         let captured_raw = self
                             .tmux_mgr
                             .capture_pane(&window_id)
@@ -1870,26 +1926,7 @@ impl Server {
                             .ok()
                             .unwrap_or_default();
                         let captured = strip_ansi(&captured_raw);
-                        let lines: Vec<&str> = captured.lines().collect();
-                        let new_text = lines
-                            .iter()
-                            .copied()
-                            .skip(baseline_len)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-
-                        let mut sid = SESSION_ID_RE
-                            .captures(&new_text)
-                            .and_then(|c| c.get(1))
-                            .map(|m| m.as_str().to_string());
-
-                        if sid.is_none() {
-                            // Try full pane as fallback (status modal may replace rather than append)
-                            sid = SESSION_ID_RE
-                                .captures(&captured)
-                                .and_then(|c| c.get(1))
-                                .map(|m| m.as_str().to_string());
-                        }
+                        let sid = session_id_from_status_capture(&baseline, &captured);
 
                         // Dismiss /status modal — send Escape, verify, retry once
                         self.tmux_mgr.send_key(&window_id, "Escape").await.ok();
@@ -1913,6 +1950,21 @@ impl Server {
                     None
                 };
 
+                if agent.supports_sessions()
+                    && agent.name() != "copilot"
+                    && discovered_sid.is_none()
+                    && binding.session_id.is_empty()
+                {
+                    let _ = self
+                        .im_adapter
+                        .send_message(
+                            &target,
+                            "Session ID is still unconfirmed. No message was forwarded.",
+                        )
+                        .await;
+                    return Ok(());
+                }
+
                 // Capture stored_sid before any mutations (owned String)
                 let stored_sid = rebind_rt
                     .window_bindings
@@ -1920,15 +1972,29 @@ impl Server {
                     .map(|wb| wb.session_id.clone())
                     .unwrap_or_default();
 
+                if !rebind_rt.window_bindings.contains_key(&window_id_str) {
+                    rebind_rt.window_bindings.insert(
+                        window_id_str.clone(),
+                        WindowBinding {
+                            window_id: window_id_str.clone(),
+                            session_id: String::new(),
+                            cwd: self.tmux_mgr.pane_cwd(&window_id).await.unwrap_or_default(),
+                            agent_type: agent_type.clone(),
+                            window_name: win_info.name.clone(),
+                        },
+                    );
+                }
+
                 // Exclusive session check: collect conflict info first (immutable), then mutate.
                 if let Some(ref sid) = discovered_sid {
-                    let conflict = rebind_rt
+                    let conflicts: Vec<String> = rebind_rt
                         .window_bindings
                         .iter()
-                        .find(|(wid, wb)| wid.as_str() != window_id_str && wb.session_id == *sid)
-                        .map(|(wid, _)| wid.clone());
+                        .filter(|(wid, wb)| wid.as_str() != window_id_str && wb.session_id == *sid)
+                        .map(|(wid, _)| wid.clone())
+                        .collect();
 
-                    if let Some(conflict_wid) = conflict {
+                    if !conflicts.is_empty() {
                         let chat_name = rebind_rt
                             .chat_bindings
                             .iter()
@@ -1937,19 +2003,40 @@ impl Server {
                             .unwrap_or_else(|| "unknown".to_string());
                         let _ = self
                     .im_adapter
-                    .send_message(
+                        .send_message(
                         &target,
                         &format!(
-                            "⚠️ Session {sid} was bound to {chat_name} (window {conflict_wid}) — rebinding to this window.",
+                            "⚠️ Session {sid} was bound to {chat_name} (windows {}) — rebinding to this window.",
+                            conflicts.join(", "),
                         ),
                     )
                     .await;
-                        // Clear old binding's session in-place (no extra load needed)
-                        if let Some(old_wb) = rebind_rt.window_bindings.get_mut(&conflict_wid) {
-                            old_wb.session_id = String::new();
+                        for conflict_wid in &conflicts {
+                            if let Some(old_wb) = rebind_rt.window_bindings.get_mut(conflict_wid) {
+                                old_wb.session_id.clear();
+                            }
+                        }
+                        for cb in &mut rebind_rt.chat_bindings {
+                            if cb.session_id == *sid
+                                && !(cb.user_id == user_id && cb.thread_id == binding.thread_id)
+                            {
+                                cb.session_id.clear();
+                            }
                         }
                     }
                 }
+
+                // A queued first message belongs to this chat and must only
+                // reach the agent after its session ID has been confirmed.
+                let pending_text = if discovered_sid.is_some() && binding.session_id.is_empty() {
+                    self.pending_messages
+                        .lock()
+                        .await
+                        .get(&(user_id, binding.thread_id))
+                        .cloned()
+                } else {
+                    None
+                };
 
                 // Update window binding
                 if let Some(wb) = rebind_rt.window_bindings.get_mut(&window_id_str) {
@@ -1991,7 +2078,7 @@ impl Server {
                     if let Some(cb) = rebind_rt
                         .chat_bindings
                         .iter_mut()
-                        .find(|cb| cb.user_id == user_id && cb.thread_id == thread_id_val)
+                        .find(|cb| cb.user_id == user_id && cb.thread_id == binding.thread_id)
                     {
                         changes.push(format!("display_name: {} → {}", cb.display_name, cn,));
                         cb.display_name = cn.clone();
@@ -2015,7 +2102,7 @@ impl Server {
                     && let Some(cb) = rebind_rt
                         .chat_bindings
                         .iter_mut()
-                        .find(|cb| cb.user_id == user_id && cb.thread_id == thread_id_val)
+                        .find(|cb| cb.user_id == user_id && cb.thread_id == binding.thread_id)
                     && cb.session_id != *sid
                 {
                     cb.session_id = sid.clone();
@@ -2036,11 +2123,16 @@ impl Server {
                             tracing::warn!("[rebind] Failed to save session_map: {e}");
                         }
                     }
+                    // Keep an existing offset: rebind must not replay the
+                    // session's earlier output into the newly bound chat.
+                    let has_offset = self.byte_offsets.lock().await.contains_key(sid);
+                    if !has_offset
+                        && let Some(path) = resolve_jsonl(sid).await
+                        && let Ok(meta) = tokio::fs::metadata(path).await
                     {
-                        let mut offsets = self.byte_offsets.lock().await;
-                        if offsets.remove(sid).is_some() {
-                            changes.push("monitor offset reset".into());
-                        }
+                        let offset = meta.len();
+                        self.byte_offsets.lock().await.insert(sid.clone(), offset);
+                        self.state_mgr.upsert_offset(sid, offset).await?;
                     }
                 }
 
@@ -2064,6 +2156,15 @@ impl Server {
                         .im_adapter
                         .send_message(&target, &format!("🔄 Rebound: {}", changes.join(", ")))
                         .await;
+                }
+                if let Some(text) = pending_text {
+                    let is_copilot = agent.name() == "copilot";
+                    self.send_text_to_agent(&window_id, &text, is_copilot)
+                        .await?;
+                    self.pending_messages
+                        .lock()
+                        .await
+                        .remove(&(user_id, binding.thread_id));
                 }
             } else {
                 let _ = self
@@ -2338,6 +2439,28 @@ impl Server {
 
         // Find binding for this user+thread
         if let Some((binding, wb_opt)) = find_cb() {
+            let mut unconfirmed_windows = rt
+                .window_bindings
+                .values()
+                .filter(|wb| wb.session_id.is_empty() && wb.window_name == binding.display_name);
+            let first = unconfirmed_windows.next();
+            let is_copilot_bootstrap = unconfirmed_windows.next().is_none()
+                && first.is_some_and(|wb| wb.agent_type == "copilot");
+            if binding.session_id.is_empty() && !is_copilot_bootstrap {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .entry((user_id, binding.thread_id))
+                    .or_insert_with(|| text.to_string());
+                let _ = self
+                    .im_adapter
+                    .send_message(
+                        &target,
+                        "Session ID is unconfirmed. Send `/rebind` to forward the pending message. Send any further messages again after rebinding.",
+                    )
+                    .await;
+                return Ok(());
+            }
             let mut window_id_str = wb_opt
                 .map(|w| &w.window_id)
                 .map(|s| s.as_str())
@@ -3603,13 +3726,12 @@ impl Server {
             .ok()
             .unwrap_or_default();
         let baseline = strip_ansi(&baseline_raw);
-        let baseline_len = baseline.lines().count();
 
         // Send /status to the agent
         self.tmux_mgr.send_line(&wid, "/status").await.ok();
         tokio::time::sleep(Duration::from_millis(2000)).await;
 
-        // Capture updated pane content and extract Session ID from new lines.
+        // Accept only a status line newly rendered by this command.
         let captured_raw = self
             .tmux_mgr
             .capture_pane(&wid)
@@ -3617,26 +3739,7 @@ impl Server {
             .ok()
             .unwrap_or_default();
         let captured = strip_ansi(&captured_raw);
-        let lines: Vec<&str> = captured.lines().collect();
-        let new_text = lines
-            .iter()
-            .copied()
-            .skip(baseline_len)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let mut sid = SESSION_ID_RE
-            .captures(&new_text)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-
-        if sid.is_none() {
-            // Full pane fallback — /status modal may replace rather than append
-            sid = SESSION_ID_RE
-                .captures(&captured)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string());
-        }
+        let sid = session_id_from_status_capture(&baseline, &captured);
 
         // Dismiss /status modal — send Escape, then verify it closed.
         // Retry once if the modal is still visible (but don't send more
@@ -3723,15 +3826,11 @@ impl Server {
     async fn resolve_agent(&self, user_id: i64, thread_id: i64) -> AgentHandle {
         let key = (user_id, thread_id);
         let name = self.pending_agents.lock().await.remove(&key);
-        match name {
-            Some(n) => self
-                .config
-                .agent_registry
-                .get(&n)
-                .cloned()
-                .unwrap_or_else(|| self.config.agent_registry.default().clone()),
-            None => self.config.agent_registry.default().clone(),
-        }
+        name.as_deref()
+            .and_then(|n| self.config.agent_registry.get(n))
+            .or_else(|| self.config.agent_registry.get(&self.config.default_agent))
+            .unwrap_or_else(|| self.config.agent_registry.default())
+            .clone()
     }
 
     /// Create a new tmux window and agent session in a specific directory.
@@ -3818,15 +3917,6 @@ impl Server {
             return Ok(());
         }
 
-        // Notify user the session is ready
-        let _ = self
-            .im_adapter
-            .send_message(
-                target,
-                "✅ Session ready! Send your message to start chatting.",
-            )
-            .await;
-
         let thread_id = target.thread_id.map(|t| t.0).unwrap_or(0);
         let cwd_str = cwd.to_string_lossy().to_string();
         let wid = window_id.0.clone();
@@ -3889,7 +3979,30 @@ impl Server {
                     reply_at_only: false,
                 })
                 .await?;
+        } else if agent.supports_sessions() && agent.name() != "copilot" {
+            if !_initial_text.is_empty() {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .insert((user_id, thread_id), _initial_text.to_string());
+            }
+            let _ = self
+                .im_adapter
+                .send_message(
+                    target,
+                    "Agent started, but its session ID could not be found. Send `/rebind` before chatting.",
+                )
+                .await;
+            return Ok(());
         }
+
+        let _ = self
+            .im_adapter
+            .send_message(
+                target,
+                "✅ Session ready! Send your message to start chatting.",
+            )
+            .await;
 
         // Forward the user's pending message to the agent.
         // Some agents (Copilot) need the message to create a session.
@@ -3897,6 +4010,10 @@ impl Server {
             let is_copilot = agent.name() == "copilot";
             self.send_text_to_agent(&window_id, _initial_text, is_copilot)
                 .await?;
+            self.pending_messages
+                .lock()
+                .await
+                .remove(&(user_id, thread_id));
         }
 
         Ok(())
@@ -4023,6 +4140,8 @@ impl Server {
         topic_name: Option<&str>,
     ) -> Result<()> {
         let wid = WindowId(window_id.to_string());
+        let thread_id = target.thread_id.map(|t| t.0).unwrap_or(0);
+        let agent = self.resolve_agent(user_id, thread_id).await;
         let window_name = match topic_name {
             Some(name) => name.to_string(),
             None => format!("atim-{user_id}"),
@@ -4035,9 +4154,6 @@ impl Server {
         if let Ok(info) = self.tmux_mgr.find_window(&wid).await
             && is_shell_process(&info.current_command)
         {
-            let agent = self
-                .resolve_agent(user_id, target.thread_id.map(|t| t.0).unwrap_or(0))
-                .await;
             let launch_cmd = agent_launch_cmd(&agent);
             self.tmux_mgr.send_line(&wid, &launch_cmd).await?;
             // Wait for agent process to start
@@ -4088,9 +4204,7 @@ impl Server {
             .await;
 
         // Persist via V2 API
-        let thread_id = target.thread_id.map(|t| t.0).unwrap_or(0);
         let cwd = self.tmux_mgr.pane_cwd(&wid).await.unwrap_or_default();
-        let agent = self.resolve_agent(user_id, thread_id).await;
 
         self.state_mgr
             .upsert_window_binding(&WindowBinding {
@@ -4142,6 +4256,21 @@ impl Server {
                     reply_at_only: false,
                 })
                 .await?;
+        } else if agent.supports_sessions() && agent.name() != "copilot" {
+            if !_text.is_empty() {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .insert((user_id, thread_id), _text.to_string());
+            }
+            let _ = self
+                .im_adapter
+                .send_message(
+                    target,
+                    "Session ID could not be found. Send `/rebind` before chatting.",
+                )
+                .await;
+            return Ok(());
         }
 
         // Forward the user's pending message to the agent.
@@ -4149,6 +4278,10 @@ impl Server {
         if !_text.is_empty() {
             let is_copilot = agent.name() == "copilot";
             self.send_text_to_agent(&wid, _text, is_copilot).await?;
+            self.pending_messages
+                .lock()
+                .await
+                .remove(&(user_id, thread_id));
         }
 
         Ok(())
@@ -6143,6 +6276,61 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn test_status_session_id_formats() {
+        let id = "01a12a4f-fafd-7903-abbf-7ee6d5d3bcbc";
+        for status in [
+            format!("Session:             {id}"),
+            format!("Session ID: {id}"),
+        ] {
+            assert_eq!(
+                SESSION_ID_RE
+                    .captures(&status)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str()),
+                Some(id)
+            );
+        }
+    }
+
+    #[test]
+    fn test_status_session_id_must_be_newly_rendered() {
+        let stale = "01a12dd4-7386-7292-a848-ba866b96e126";
+        let current = "01a1198d-6e38-7331-b663-1f2f84ec94ff";
+        let before = format!("old output\nSession: {stale}\n› Ask Codex to do anything\n");
+
+        assert_eq!(session_id_from_status_capture(&before, &before), None);
+        assert_eq!(
+            session_id_from_status_capture(&before, &format!("{before}Session: {stale}\n")),
+            Some(stale.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(
+                &before,
+                &format!("{before}/status\nSession: {current}\n")
+            ),
+            Some(current.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(&before, &format!("Session ID: {current}\nStatus\n")),
+            Some(current.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(
+                &before,
+                &format!("old output\nSession: {stale}\n│ Session: {current} │\n")
+            ),
+            Some(current.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(
+                &before,
+                &format!("old output\nSession: {stale}\n/status\n")
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn test_make_and_validate_callback_token() {
         let mut contexts = HashMap::new();
         let token = Server::make_callback_token(&mut contexts, 100, -456);
@@ -6423,6 +6611,37 @@ mod tests {
             },
         );
         rt
+    }
+
+    #[test]
+    fn test_session_id_regex_matches_claude_and_codex_status() {
+        let sid = "01a13829-6833-7862-b162-81f4c7255141";
+        for status in [
+            format!("Session ID: {sid}"),
+            format!("  Session:             {sid}\n"),
+        ] {
+            assert_eq!(
+                SESSION_ID_RE
+                    .captures(&status)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str()),
+                Some(sid)
+            );
+        }
+        assert!(
+            SESSION_ID_RE
+                .captures("Previous Session: 01a13829-6833-7862-b162-81f4c7255141")
+                .is_none()
+        );
+        let history = format!("Session: 01a12f0a-0d32-7473-be37-20566102025b\nSession: {sid}");
+        assert_eq!(
+            SESSION_ID_RE
+                .captures_iter(&history)
+                .last()
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str()),
+            Some(sid)
+        );
     }
 
     #[test]

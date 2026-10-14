@@ -162,7 +162,12 @@ impl Agent for CodexAgent {
     }
 
     fn extra_args(&self) -> Vec<String> {
-        vec!["--yolo".into()]
+        vec![
+            "--sandbox".into(),
+            "danger-full-access".into(),
+            "--ask-for-approval".into(),
+            "never".into(),
+        ]
     }
 
     fn supports_sessions(&self) -> bool {
@@ -259,6 +264,15 @@ mod tests {
     fn test_codex_agent_launch_command() {
         let agent = CodexAgent;
         assert_eq!(agent.new_session_command(), "codex");
+        assert_eq!(
+            agent.extra_args(),
+            [
+                "--sandbox",
+                "danger-full-access",
+                "--ask-for-approval",
+                "never"
+            ]
+        );
     }
 
     #[test]

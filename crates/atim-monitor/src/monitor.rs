@@ -302,7 +302,7 @@ impl SessionMonitor {
             && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data)
         {
             for sid in map.values() {
-                if !sessions.contains(sid) {
+                if !sid.is_empty() && !sessions.contains(sid) {
                     sessions.push(sid.clone());
                 }
             }
@@ -317,7 +317,7 @@ impl SessionMonitor {
             >(&data)
         {
             for sid in parsed.keys() {
-                if !sessions.contains(sid) {
+                if !sid.is_empty() && !sessions.contains(sid) {
                     sessions.push(sid.clone());
                 }
             }
@@ -555,7 +555,11 @@ impl SessionMonitor {
         // Collect sessions from byte_offsets + catch any from session_map not yet tracked
         let mut session_ids: Vec<String> = {
             let offsets = self.byte_offsets.lock().await;
-            offsets.keys().cloned().collect()
+            offsets
+                .keys()
+                .filter(|sid| !sid.is_empty())
+                .cloned()
+                .collect()
         };
         // Check if any sessions from session_map.json or state.json are missing from
         // byte_offsets (jsonl appeared late, or session not in session_map).
@@ -819,19 +823,6 @@ impl SessionMonitor {
                                                     tracing::info!(
                                                         "[monitor] Discovered untracked Codex session {sid_str} via fs scan"
                                                     );
-                                                    // Auto-bind: match CWD against window bindings with empty session_id
-                                                    match atim_parser::codex_jsonl::CodexJsonlParser::read_meta(&path).await {
-                                                        Ok(meta) if !meta.cwd.is_empty() => {
-                                                            tracing::debug!("[monitor] Codex auto-bind: session={sid_str} cwd={}", meta.cwd);
-                                                            self.try_bind_codex_session(&sid_str, &meta.cwd).await;
-                                                        }
-                                                        Ok(_) => {
-                                                            tracing::debug!("[monitor] Codex auto-bind: session={sid_str} has empty cwd, skipping");
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::debug!("[monitor] Codex auto-bind: failed to read meta for {sid_str}: {e}");
-                                                        }
-                                                    }
                                                     session_ids.push(sid_str);
                                                 }
                                             }
@@ -937,57 +928,6 @@ impl SessionMonitor {
 
         Ok(())
     }
-
-    /// Try to bind a discovered Codex session to a window binding with matching CWD.
-    async fn try_bind_codex_session(&self, session_id: &str, cwd: &str) {
-        let parent_dir = self.monitor_state_path.parent().unwrap_or(Path::new("."));
-        let db_path = parent_dir.join("store.db");
-        tracing::debug!("[monitor] Codex auto-bind: db_path={}", db_path.display());
-        if !db_path.exists() {
-            tracing::debug!("[monitor] Codex auto-bind: store.db not found");
-            return;
-        }
-        // Open a separate connection to avoid lock contention with the main store
-        let db = match rusqlite::Connection::open(&db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("[monitor] Codex auto-bind: failed to open db: {e}");
-                return;
-            }
-        };
-        // Auto-bind only to windows that are BOTH:
-        // - agent_type = 'codex' AND
-        // - session_id = '' (unbound codex window)
-        // Never overwrite an existing session_id on any window.
-        match db.execute(
-            "UPDATE window_bindings SET session_id = ?1
-             WHERE cwd = ?2 AND agent_type = 'codex' AND session_id = ''",
-            rusqlite::params![session_id, cwd],
-        ) {
-            Ok(0) => {
-                tracing::debug!(
-                    "[monitor] Codex auto-bind: no matching codex/unbound window for cwd={cwd}"
-                );
-            }
-            Ok(n) => {
-                tracing::info!(
-                    "[monitor] Auto-bound Codex session {session_id} to {n} window(s) with cwd={cwd}"
-                );
-                // Also update chat_bindings with matching display_name (only unbound ones)
-                let _ = db.execute(
-                    "UPDATE chat_bindings SET session_id = ?1
-                     WHERE display_name IN (
-                         SELECT window_name FROM window_bindings WHERE session_id = ?1 AND cwd = ?2
-                     ) AND session_id = ''",
-                    rusqlite::params![session_id, cwd],
-                );
-            }
-            Err(e) => {
-                tracing::warn!("[monitor] Failed to auto-bind Codex session: {e}");
-            }
-        }
-    }
-
     /// Save current byte offsets to disk atomically.
     async fn save_offsets(&self) {
         let offsets = self.byte_offsets.lock().await;
