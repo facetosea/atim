@@ -160,13 +160,34 @@ const MAX_MSG_LEN: usize = 3800;
 /// giving `enqueue_session_output` a defined overflow point.
 const OUTBOUND_QUEUE_CAP: usize = 256;
 
-/// Pre-compiled regex for extracting the Session ID from `/status` output.
+/// Pre-compiled regex for extracting the session ID from Claude or Codex `/status` output.
 static SESSION_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"Session ID:\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        r"Session(?: ID)?:\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     )
     .expect("SESSION_ID_RE is valid")
 });
+
+/// A status modal can redraw the pane instead of appending lines, so compare
+/// rendered lines rather than their positions in the capture.
+fn session_id_from_status_capture(before: &str, after: &str) -> Option<String> {
+    let mut old_lines = std::collections::HashMap::<&str, usize>::new();
+    for line in before.lines().map(str::trim) {
+        *old_lines.entry(line).or_default() += 1;
+    }
+    after
+        .lines()
+        .map(str::trim)
+        .filter(|line| match old_lines.get_mut(line) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .filter_map(|line| SESSION_ID_RE.captures(line).map(|c| c[1].to_string()))
+        .last()
+}
 
 impl Server {
     /// Generate a short callback context token and store the validation context.
@@ -1856,13 +1877,12 @@ impl Server {
                             .ok()
                             .unwrap_or_default();
                         let baseline = strip_ansi(&baseline_raw);
-                        let baseline_len = baseline.lines().count();
 
-                        // Send /status to Claude Code
+                        // Send /status to the running agent.
                         self.tmux_mgr.send_line(&window_id, "/status").await.ok();
                         tokio::time::sleep(Duration::from_millis(2000)).await;
 
-                        // Capture updated pane, strip ANSI, then extract Session ID.
+                        // Accept only a status line newly rendered by this command.
                         let captured_raw = self
                             .tmux_mgr
                             .capture_pane(&window_id)
@@ -1870,26 +1890,7 @@ impl Server {
                             .ok()
                             .unwrap_or_default();
                         let captured = strip_ansi(&captured_raw);
-                        let lines: Vec<&str> = captured.lines().collect();
-                        let new_text = lines
-                            .iter()
-                            .copied()
-                            .skip(baseline_len)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-
-                        let mut sid = SESSION_ID_RE
-                            .captures(&new_text)
-                            .and_then(|c| c.get(1))
-                            .map(|m| m.as_str().to_string());
-
-                        if sid.is_none() {
-                            // Try full pane as fallback (status modal may replace rather than append)
-                            sid = SESSION_ID_RE
-                                .captures(&captured)
-                                .and_then(|c| c.get(1))
-                                .map(|m| m.as_str().to_string());
-                        }
+                        let sid = session_id_from_status_capture(&baseline, &captured);
 
                         // Dismiss /status modal — send Escape, verify, retry once
                         self.tmux_mgr.send_key(&window_id, "Escape").await.ok();
@@ -3603,13 +3604,12 @@ impl Server {
             .ok()
             .unwrap_or_default();
         let baseline = strip_ansi(&baseline_raw);
-        let baseline_len = baseline.lines().count();
 
         // Send /status to the agent
         self.tmux_mgr.send_line(&wid, "/status").await.ok();
         tokio::time::sleep(Duration::from_millis(2000)).await;
 
-        // Capture updated pane content and extract Session ID from new lines.
+        // Accept only a status line newly rendered by this command.
         let captured_raw = self
             .tmux_mgr
             .capture_pane(&wid)
@@ -3617,26 +3617,7 @@ impl Server {
             .ok()
             .unwrap_or_default();
         let captured = strip_ansi(&captured_raw);
-        let lines: Vec<&str> = captured.lines().collect();
-        let new_text = lines
-            .iter()
-            .copied()
-            .skip(baseline_len)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let mut sid = SESSION_ID_RE
-            .captures(&new_text)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-
-        if sid.is_none() {
-            // Full pane fallback — /status modal may replace rather than append
-            sid = SESSION_ID_RE
-                .captures(&captured)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().to_string());
-        }
+        let sid = session_id_from_status_capture(&baseline, &captured);
 
         // Dismiss /status modal — send Escape, then verify it closed.
         // Retry once if the modal is still visible (but don't send more
@@ -3723,15 +3704,11 @@ impl Server {
     async fn resolve_agent(&self, user_id: i64, thread_id: i64) -> AgentHandle {
         let key = (user_id, thread_id);
         let name = self.pending_agents.lock().await.remove(&key);
-        match name {
-            Some(n) => self
-                .config
-                .agent_registry
-                .get(&n)
-                .cloned()
-                .unwrap_or_else(|| self.config.agent_registry.default().clone()),
-            None => self.config.agent_registry.default().clone(),
-        }
+        name.as_deref()
+            .and_then(|n| self.config.agent_registry.get(n))
+            .or_else(|| self.config.agent_registry.get(&self.config.default_agent))
+            .unwrap_or_else(|| self.config.agent_registry.default())
+            .clone()
     }
 
     /// Create a new tmux window and agent session in a specific directory.
@@ -4023,6 +4000,8 @@ impl Server {
         topic_name: Option<&str>,
     ) -> Result<()> {
         let wid = WindowId(window_id.to_string());
+        let thread_id = target.thread_id.map(|t| t.0).unwrap_or(0);
+        let agent = self.resolve_agent(user_id, thread_id).await;
         let window_name = match topic_name {
             Some(name) => name.to_string(),
             None => format!("atim-{user_id}"),
@@ -4035,9 +4014,6 @@ impl Server {
         if let Ok(info) = self.tmux_mgr.find_window(&wid).await
             && is_shell_process(&info.current_command)
         {
-            let agent = self
-                .resolve_agent(user_id, target.thread_id.map(|t| t.0).unwrap_or(0))
-                .await;
             let launch_cmd = agent_launch_cmd(&agent);
             self.tmux_mgr.send_line(&wid, &launch_cmd).await?;
             // Wait for agent process to start
@@ -4088,9 +4064,7 @@ impl Server {
             .await;
 
         // Persist via V2 API
-        let thread_id = target.thread_id.map(|t| t.0).unwrap_or(0);
         let cwd = self.tmux_mgr.pane_cwd(&wid).await.unwrap_or_default();
-        let agent = self.resolve_agent(user_id, thread_id).await;
 
         self.state_mgr
             .upsert_window_binding(&WindowBinding {
@@ -6141,6 +6115,61 @@ mod tests {
     use super::*;
     use atim_core::card::{ActionLayout, CardElement};
     use std::collections::HashMap;
+
+    #[test]
+    fn test_status_session_id_formats() {
+        let id = "01a12a4f-fafd-7903-abbf-7ee6d5d3bcbc";
+        for status in [
+            format!("Session:             {id}"),
+            format!("Session ID: {id}"),
+        ] {
+            assert_eq!(
+                SESSION_ID_RE
+                    .captures(&status)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str()),
+                Some(id)
+            );
+        }
+    }
+
+    #[test]
+    fn test_status_session_id_must_be_newly_rendered() {
+        let stale = "01a12dd4-7386-7292-a848-ba866b96e126";
+        let current = "01a1198d-6e38-7331-b663-1f2f84ec94ff";
+        let before = format!("old output\nSession: {stale}\n› Ask Codex to do anything\n");
+
+        assert_eq!(session_id_from_status_capture(&before, &before), None);
+        assert_eq!(
+            session_id_from_status_capture(&before, &format!("{before}Session: {stale}\n")),
+            Some(stale.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(
+                &before,
+                &format!("{before}/status\nSession: {current}\n")
+            ),
+            Some(current.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(&before, &format!("Session ID: {current}\nStatus\n")),
+            Some(current.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(
+                &before,
+                &format!("old output\nSession: {stale}\n│ Session: {current} │\n")
+            ),
+            Some(current.to_string())
+        );
+        assert_eq!(
+            session_id_from_status_capture(
+                &before,
+                &format!("old output\nSession: {stale}\n/status\n")
+            ),
+            None
+        );
+    }
 
     #[test]
     fn test_make_and_validate_callback_token() {
