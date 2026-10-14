@@ -160,10 +160,10 @@ const MAX_MSG_LEN: usize = 3800;
 /// giving `enqueue_session_output` a defined overflow point.
 const OUTBOUND_QUEUE_CAP: usize = 256;
 
-/// Pre-compiled regex for extracting the Session ID from `/status` output.
+/// Match Claude's `Session ID:` and Codex's `Session:` status fields.
 static SESSION_ID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"Session ID:\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        r"(?m)^\s*Session(?: ID)?:\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$",
     )
     .expect("SESSION_ID_RE is valid")
 });
@@ -1886,7 +1886,8 @@ impl Server {
                         if sid.is_none() {
                             // Try full pane as fallback (status modal may replace rather than append)
                             sid = SESSION_ID_RE
-                                .captures(&captured)
+                                .captures_iter(&captured)
+                                .last()
                                 .and_then(|c| c.get(1))
                                 .map(|m| m.as_str().to_string());
                         }
@@ -2036,11 +2037,16 @@ impl Server {
                             tracing::warn!("[rebind] Failed to save session_map: {e}");
                         }
                     }
+                    // Keep an existing offset: rebind must not replay the
+                    // session's earlier output into the newly bound chat.
+                    let has_offset = self.byte_offsets.lock().await.contains_key(sid);
+                    if !has_offset
+                        && let Some(path) = resolve_jsonl(sid).await
+                        && let Ok(meta) = tokio::fs::metadata(path).await
                     {
-                        let mut offsets = self.byte_offsets.lock().await;
-                        if offsets.remove(sid).is_some() {
-                            changes.push("monitor offset reset".into());
-                        }
+                        let offset = meta.len();
+                        self.byte_offsets.lock().await.insert(sid.clone(), offset);
+                        self.state_mgr.upsert_offset(sid, offset).await?;
                     }
                 }
 
@@ -3633,7 +3639,8 @@ impl Server {
         if sid.is_none() {
             // Full pane fallback — /status modal may replace rather than append
             sid = SESSION_ID_RE
-                .captures(&captured)
+                .captures_iter(&captured)
+                .last()
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str().to_string());
         }
@@ -6423,6 +6430,37 @@ mod tests {
             },
         );
         rt
+    }
+
+    #[test]
+    fn test_session_id_regex_matches_claude_and_codex_status() {
+        let sid = "01a13829-6833-7862-b162-81f4c7255141";
+        for status in [
+            format!("Session ID: {sid}"),
+            format!("  Session:             {sid}\n"),
+        ] {
+            assert_eq!(
+                SESSION_ID_RE
+                    .captures(&status)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str()),
+                Some(sid)
+            );
+        }
+        assert!(
+            SESSION_ID_RE
+                .captures("Previous Session: 01a13829-6833-7862-b162-81f4c7255141")
+                .is_none()
+        );
+        let history = format!("Session: 01a12f0a-0d32-7473-be37-20566102025b\nSession: {sid}");
+        assert_eq!(
+            SESSION_ID_RE
+                .captures_iter(&history)
+                .last()
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str()),
+            Some(sid)
+        );
     }
 
     #[test]
