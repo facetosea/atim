@@ -139,6 +139,18 @@ impl TmuxManager {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    async fn send_keys(&self, args: &[&str]) -> Result<()> {
+        for attempt in 0..=3 {
+            match self.tmux(args).await {
+                Err(Error::Tmux(msg)) if msg.contains("no current client") && attempt < 3 => {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                result => return result.map(|_| ()),
+            }
+        }
+        unreachable!()
+    }
+
     // ── Window listing ──
 
     /// List all windows in the session.
@@ -338,16 +350,10 @@ impl TmuxManager {
     /// chunk to the pane's input line, so the agent still receives the full
     /// text in one input.
     pub async fn send_text(&self, window_id: &WindowId, text: &str) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.0);
         for (start, end) in chunk_ranges(text, self.send_chunk) {
-            self.tmux(&[
-                "send-keys",
-                "-t",
-                &window_id.0,
-                "-l",
-                "--",
-                &text[start..end],
-            ])
-            .await?;
+            self.send_keys(&["send-keys", "-t", &target, "-l", "--", &text[start..end]])
+                .await?;
         }
         Ok(())
     }
@@ -360,13 +366,14 @@ impl TmuxManager {
     /// named key "Escape" as visible text instead of sending the actual key.
     /// All other key names are sent via tmux's named-key protocol.
     pub async fn send_key(&self, window_id: &WindowId, key: &str) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.0);
         if key == "Escape" {
             // Send literal ESC byte (0x1B) via send-keys -l to avoid
             // psmux rendering "Escape" as visible text.
-            self.tmux(&["send-keys", "-t", &window_id.0, "-l", "\x1b"])
+            self.send_keys(&["send-keys", "-t", &target, "-l", "\x1b"])
                 .await?;
         } else {
-            self.tmux(&["send-keys", "-t", &window_id.0, key]).await?;
+            self.send_keys(&["send-keys", "-t", &target, key]).await?;
         }
         Ok(())
     }
@@ -394,10 +401,11 @@ impl TmuxManager {
         text: &str,
         char_delay_ms: u64,
     ) -> Result<()> {
+        let target = format!("{}:{}", self.session_name, window_id.0);
         for c in text.chars() {
             let mut buf = [0u8; 4];
             let s: &str = c.encode_utf8(&mut buf);
-            self.tmux(&["send-keys", "-t", &window_id.0, "-l", s])
+            self.send_keys(&["send-keys", "-t", &target, "-l", s])
                 .await?;
             if char_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(char_delay_ms)).await;
