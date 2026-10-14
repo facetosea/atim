@@ -510,6 +510,9 @@ impl Server {
         // Filter and group messages by session_id
         let mut by_session: HashMap<String, Vec<&atim_core::message::NewMessage>> = HashMap::new();
         for msg in &messages {
+            if msg.session_id.0.is_empty() {
+                continue;
+            }
             tracing::debug!(
                 "[pipe] NewMessage: session_id={}, role={}, content_type={:?}, complete={}, text_len={}",
                 msg.session_id.0,
@@ -543,7 +546,7 @@ impl Server {
 
         for (_sid, group) in &by_session {
             // Resolve to chat binding by session_id directly (V2)
-            let binding = match rt.chat_bindings.iter().find(|cb| cb.session_id == *_sid) {
+            let binding = match rt.chat_bindings.iter().rfind(|cb| cb.session_id == *_sid) {
                 Some(cb) => cb.clone(),
                 None => {
                     tracing::warn!(
@@ -554,6 +557,11 @@ impl Server {
                     continue;
                 }
             };
+
+            if !rt.window_bindings.values().any(|wb| wb.session_id == *_sid) {
+                tracing::warn!("[pipe] Skipping session_id={_sid}: no matching window binding");
+                continue;
+            }
 
             let chat_id = binding.group_chat_id.unwrap_or(binding.chat_id);
             let thread_id_val = binding.thread_id;
@@ -1762,11 +1770,39 @@ impl Server {
 
         // Handle /rebind — detect running agent and session, then (re)bind exclusively
         if text.trim() == "/rebind" {
-            if let Some((binding, _wb_opt)) = find_cb() {
-                // Find the tmux window by matching the display_name (window name)
-                // rather than relying on stale session-based bindings.
-                // Fall back to target.chat_name if display_name is stale.
-                let wid_str = match self.find_window_by_name(&binding.display_name).await {
+            if let Some((binding, wb_opt)) = find_cb() {
+                // The stored window ID survives a chat rename. Verify that it
+                // still belongs to our session before falling back to names.
+                let provisional = if binding.session_id.is_empty() {
+                    let mut matches = rt.window_bindings.values().filter(|wb| {
+                        wb.session_id.is_empty() && wb.window_name == binding.display_name
+                    });
+                    let first = matches.next();
+                    if matches.next().is_none() {
+                        first
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let stored_window = if let Some(wb) = wb_opt.or(provisional) {
+                    let wid = WindowId(wb.window_id.clone());
+                    self.tmux_mgr
+                        .find_window(&wid)
+                        .await
+                        .ok()
+                        .filter(|info| info.window_id == wid)
+                        .map(|_| wid.0)
+                } else {
+                    None
+                };
+                let window_by_name = if stored_window.is_none() {
+                    self.find_window_by_name(&binding.display_name).await
+                } else {
+                    None
+                };
+                let wid_str = match stored_window.or(window_by_name) {
                     Some(wid) => wid,
                     None => {
                         // Try the IM chat_name as fallback — display_name may be stale
@@ -1914,6 +1950,21 @@ impl Server {
                     None
                 };
 
+                if agent.supports_sessions()
+                    && agent.name() != "copilot"
+                    && discovered_sid.is_none()
+                    && binding.session_id.is_empty()
+                {
+                    let _ = self
+                        .im_adapter
+                        .send_message(
+                            &target,
+                            "Session ID is still unconfirmed. No message was forwarded.",
+                        )
+                        .await;
+                    return Ok(());
+                }
+
                 // Capture stored_sid before any mutations (owned String)
                 let stored_sid = rebind_rt
                     .window_bindings
@@ -1921,15 +1972,29 @@ impl Server {
                     .map(|wb| wb.session_id.clone())
                     .unwrap_or_default();
 
+                if !rebind_rt.window_bindings.contains_key(&window_id_str) {
+                    rebind_rt.window_bindings.insert(
+                        window_id_str.clone(),
+                        WindowBinding {
+                            window_id: window_id_str.clone(),
+                            session_id: String::new(),
+                            cwd: self.tmux_mgr.pane_cwd(&window_id).await.unwrap_or_default(),
+                            agent_type: agent_type.clone(),
+                            window_name: win_info.name.clone(),
+                        },
+                    );
+                }
+
                 // Exclusive session check: collect conflict info first (immutable), then mutate.
                 if let Some(ref sid) = discovered_sid {
-                    let conflict = rebind_rt
+                    let conflicts: Vec<String> = rebind_rt
                         .window_bindings
                         .iter()
-                        .find(|(wid, wb)| wid.as_str() != window_id_str && wb.session_id == *sid)
-                        .map(|(wid, _)| wid.clone());
+                        .filter(|(wid, wb)| wid.as_str() != window_id_str && wb.session_id == *sid)
+                        .map(|(wid, _)| wid.clone())
+                        .collect();
 
-                    if let Some(conflict_wid) = conflict {
+                    if !conflicts.is_empty() {
                         let chat_name = rebind_rt
                             .chat_bindings
                             .iter()
@@ -1938,19 +2003,40 @@ impl Server {
                             .unwrap_or_else(|| "unknown".to_string());
                         let _ = self
                     .im_adapter
-                    .send_message(
+                        .send_message(
                         &target,
                         &format!(
-                            "⚠️ Session {sid} was bound to {chat_name} (window {conflict_wid}) — rebinding to this window.",
+                            "⚠️ Session {sid} was bound to {chat_name} (windows {}) — rebinding to this window.",
+                            conflicts.join(", "),
                         ),
                     )
                     .await;
-                        // Clear old binding's session in-place (no extra load needed)
-                        if let Some(old_wb) = rebind_rt.window_bindings.get_mut(&conflict_wid) {
-                            old_wb.session_id = String::new();
+                        for conflict_wid in &conflicts {
+                            if let Some(old_wb) = rebind_rt.window_bindings.get_mut(conflict_wid) {
+                                old_wb.session_id.clear();
+                            }
+                        }
+                        for cb in &mut rebind_rt.chat_bindings {
+                            if cb.session_id == *sid
+                                && !(cb.user_id == user_id && cb.thread_id == binding.thread_id)
+                            {
+                                cb.session_id.clear();
+                            }
                         }
                     }
                 }
+
+                // A queued first message belongs to this chat and must only
+                // reach the agent after its session ID has been confirmed.
+                let pending_text = if discovered_sid.is_some() && binding.session_id.is_empty() {
+                    self.pending_messages
+                        .lock()
+                        .await
+                        .get(&(user_id, binding.thread_id))
+                        .cloned()
+                } else {
+                    None
+                };
 
                 // Update window binding
                 if let Some(wb) = rebind_rt.window_bindings.get_mut(&window_id_str) {
@@ -1992,7 +2078,7 @@ impl Server {
                     if let Some(cb) = rebind_rt
                         .chat_bindings
                         .iter_mut()
-                        .find(|cb| cb.user_id == user_id && cb.thread_id == thread_id_val)
+                        .find(|cb| cb.user_id == user_id && cb.thread_id == binding.thread_id)
                     {
                         changes.push(format!("display_name: {} → {}", cb.display_name, cn,));
                         cb.display_name = cn.clone();
@@ -2016,7 +2102,7 @@ impl Server {
                     && let Some(cb) = rebind_rt
                         .chat_bindings
                         .iter_mut()
-                        .find(|cb| cb.user_id == user_id && cb.thread_id == thread_id_val)
+                        .find(|cb| cb.user_id == user_id && cb.thread_id == binding.thread_id)
                     && cb.session_id != *sid
                 {
                     cb.session_id = sid.clone();
@@ -2070,6 +2156,15 @@ impl Server {
                         .im_adapter
                         .send_message(&target, &format!("🔄 Rebound: {}", changes.join(", ")))
                         .await;
+                }
+                if let Some(text) = pending_text {
+                    let is_copilot = agent.name() == "copilot";
+                    self.send_text_to_agent(&window_id, &text, is_copilot)
+                        .await?;
+                    self.pending_messages
+                        .lock()
+                        .await
+                        .remove(&(user_id, binding.thread_id));
                 }
             } else {
                 let _ = self
@@ -2344,6 +2439,28 @@ impl Server {
 
         // Find binding for this user+thread
         if let Some((binding, wb_opt)) = find_cb() {
+            let mut unconfirmed_windows = rt
+                .window_bindings
+                .values()
+                .filter(|wb| wb.session_id.is_empty() && wb.window_name == binding.display_name);
+            let first = unconfirmed_windows.next();
+            let is_copilot_bootstrap = unconfirmed_windows.next().is_none()
+                && first.is_some_and(|wb| wb.agent_type == "copilot");
+            if binding.session_id.is_empty() && !is_copilot_bootstrap {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .entry((user_id, binding.thread_id))
+                    .or_insert_with(|| text.to_string());
+                let _ = self
+                    .im_adapter
+                    .send_message(
+                        &target,
+                        "Session ID is unconfirmed. Send `/rebind` to forward the pending message. Send any further messages again after rebinding.",
+                    )
+                    .await;
+                return Ok(());
+            }
             let mut window_id_str = wb_opt
                 .map(|w| &w.window_id)
                 .map(|s| s.as_str())
@@ -3800,15 +3917,6 @@ impl Server {
             return Ok(());
         }
 
-        // Notify user the session is ready
-        let _ = self
-            .im_adapter
-            .send_message(
-                target,
-                "✅ Session ready! Send your message to start chatting.",
-            )
-            .await;
-
         let thread_id = target.thread_id.map(|t| t.0).unwrap_or(0);
         let cwd_str = cwd.to_string_lossy().to_string();
         let wid = window_id.0.clone();
@@ -3871,7 +3979,30 @@ impl Server {
                     reply_at_only: false,
                 })
                 .await?;
+        } else if agent.supports_sessions() && agent.name() != "copilot" {
+            if !_initial_text.is_empty() {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .insert((user_id, thread_id), _initial_text.to_string());
+            }
+            let _ = self
+                .im_adapter
+                .send_message(
+                    target,
+                    "Agent started, but its session ID could not be found. Send `/rebind` before chatting.",
+                )
+                .await;
+            return Ok(());
         }
+
+        let _ = self
+            .im_adapter
+            .send_message(
+                target,
+                "✅ Session ready! Send your message to start chatting.",
+            )
+            .await;
 
         // Forward the user's pending message to the agent.
         // Some agents (Copilot) need the message to create a session.
@@ -3879,6 +4010,10 @@ impl Server {
             let is_copilot = agent.name() == "copilot";
             self.send_text_to_agent(&window_id, _initial_text, is_copilot)
                 .await?;
+            self.pending_messages
+                .lock()
+                .await
+                .remove(&(user_id, thread_id));
         }
 
         Ok(())
@@ -4121,6 +4256,21 @@ impl Server {
                     reply_at_only: false,
                 })
                 .await?;
+        } else if agent.supports_sessions() && agent.name() != "copilot" {
+            if !_text.is_empty() {
+                self.pending_messages
+                    .lock()
+                    .await
+                    .insert((user_id, thread_id), _text.to_string());
+            }
+            let _ = self
+                .im_adapter
+                .send_message(
+                    target,
+                    "Session ID could not be found. Send `/rebind` before chatting.",
+                )
+                .await;
+            return Ok(());
         }
 
         // Forward the user's pending message to the agent.
@@ -4128,6 +4278,10 @@ impl Server {
         if !_text.is_empty() {
             let is_copilot = agent.name() == "copilot";
             self.send_text_to_agent(&wid, _text, is_copilot).await?;
+            self.pending_messages
+                .lock()
+                .await
+                .remove(&(user_id, thread_id));
         }
 
         Ok(())

@@ -95,9 +95,7 @@ impl TmuxManager {
 
     /// Run `tmux` with the given args and return stdout as a String.
     ///
-    /// Automatically recovers from a dead tmux server: if the server socket
-    /// is stale ("no server running"), creates a new session and retries.
-    /// Also retries transient EIO errors (e.g. an underlying disk hiccup on
+    /// Retries transient EIO errors (e.g. an underlying disk hiccup on
     /// a mounted filesystem) so a single glitch doesn't fail the operation.
     async fn tmux(&self, args: &[&str]) -> Result<String> {
         const MAX_EIO_RETRIES: u32 = 3;
@@ -116,7 +114,6 @@ impl TmuxManager {
                         msg
                     );
                     tokio::time::sleep(Duration::from_millis(500 * eio_attempt as u64)).await;
-                    // Skip the dead-server recovery path for EIO — just retry.
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -124,7 +121,7 @@ impl TmuxManager {
         }
     }
 
-    /// Execute one tmux command, including the dead-server recovery path.
+    /// Execute one tmux command.
     async fn tmux_once(&self, args: &[&str]) -> Result<String> {
         let output = Command::new(&self.binary)
             .args(args)
@@ -136,32 +133,6 @@ impl TmuxManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let err_msg = format!("tmux {} failed: {stderr}", args.join(" "));
 
-            // Recover from a dead tmux server
-            if stderr.contains("no server running") {
-                tracing::warn!(
-                    "tmux server not running, re-creating session \"{}\"",
-                    self.session_name
-                );
-                let _ = Command::new(&self.binary)
-                    .args(["new-session", "-d", "-s", &self.session_name])
-                    .output()
-                    .await;
-                // Retry the original command
-                let retry = Command::new(&self.binary)
-                    .args(args)
-                    .output()
-                    .await
-                    .map_err(|e| Error::Tmux(format!("failed to execute {}: {e}", self.binary)))?;
-                if retry.status.success() {
-                    return Ok(String::from_utf8_lossy(&retry.stdout).to_string());
-                }
-                let retry_stderr = String::from_utf8_lossy(&retry.stderr);
-                return Err(Error::Tmux(format!(
-                    "tmux {} failed (after server restart): {retry_stderr}",
-                    args.join(" ")
-                )));
-            }
-
             return Err(Error::Tmux(err_msg));
         }
 
@@ -172,7 +143,7 @@ impl TmuxManager {
 
     /// List all windows in the session.
     ///
-    /// Returns `Ok(vec![])` if the session does not exist (no error).
+    /// Returns an error if the session does not exist.
     pub async fn list_windows(&self) -> Result<Vec<WindowInfo>> {
         let out = self
             .tmux(&[
@@ -247,6 +218,29 @@ impl TmuxManager {
     /// placement hits an "index in use" conflict (e.g. from leftover
     /// windows of a previous run).
     pub async fn new_window(&self, name: &str, cwd: &str) -> Result<WindowId> {
+        if !self.session_exists().await {
+            match self
+                .tmux(&[
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &self.session_name,
+                    "-n",
+                    name,
+                    "-c",
+                    cwd,
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                ])
+                .await
+            {
+                Ok(out) => return Ok(WindowId(out.trim().to_string())),
+                // Another request may have created the session after our probe.
+                Err(Error::Tmux(msg)) if msg.contains("duplicate session") => {}
+                Err(e) => return Err(e),
+            }
+        }
         let result = self
             .tmux(&[
                 "new-window",
@@ -271,6 +265,24 @@ impl TmuxManager {
                         "new-window",
                         "-a",
                         "-t",
+                        &self.session_name,
+                        "-n",
+                        name,
+                        "-c",
+                        cwd,
+                        "-P",
+                        "-F",
+                        "#{window_id}",
+                    ])
+                    .await?;
+                Ok(WindowId(out.trim().to_string()))
+            }
+            Err(Error::Tmux(msg)) if msg.contains("no server running") => {
+                let out = self
+                    .tmux(&[
+                        "new-session",
+                        "-d",
+                        "-s",
                         &self.session_name,
                         "-n",
                         name,

@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
     let byte_offsets = state_mgr.load_monitor_offsets().await?;
     let byte_offsets = Arc::new(Mutex::new(byte_offsets));
 
-    // 4. Ensure terminal session exists, then rebuild window bindings.
+    // 4. Rebuild window bindings from an existing terminal session, if any.
     //    Linux/macOS: tmux CLI. Windows: psmux (native Windows tmux
     //    replacement, tmux-command-compatible — `winget install psmux`).
     use atim_core::terminal::TerminalManager;
@@ -205,9 +205,11 @@ async fn main() -> anyhow::Result<()> {
             .with_send_chunk(config.tmux_max_send_chunk),
     );
 
-    tmux_mgr.ensure_session().await?;
-
-    let windows = tmux_mgr.window_map().await?;
+    let windows = if tmux_mgr.session_exists().await {
+        tmux_mgr.window_map().await?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // 4a. Rebuild window_bindings — match by window_name since window_id (@id) is ephemeral.
     //     For each live tmux window, create or update its WindowBinding.
