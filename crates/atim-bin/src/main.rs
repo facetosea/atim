@@ -397,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
         atim_queue::flood_control::FloodControlledAdapter::new(raw_adapter.clone()),
     );
 
-    let im_handle = {
+    let mut im_handle = {
         let adapter = raw_adapter;
         tokio::spawn(async move {
             if let Err(e) = adapter.run(im_tx).await {
@@ -413,7 +413,7 @@ async fn main() -> anyhow::Result<()> {
         config.monitor_poll_interval_secs,
     );
     let (monitor_tx, mut monitor_rx) = mpsc::unbounded_channel();
-    let monitor_handle = tokio::spawn(async move {
+    let mut monitor_handle = tokio::spawn(async move {
         if let Err(e) = monitor.run(monitor_tx).await {
             tracing::error!("Session monitor exited: {e}");
         }
@@ -451,11 +451,34 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 8. Enter main event loop — wait for SIGINT (or SIGTERM on unix)
+    //
+    // The IM adapter and the session monitor run as their own tasks, and they
+    // are what atim is for: without either one the process is still running but
+    // no longer working. Their handles are polled here so that losing one ends
+    // the process with a failure instead of leaving a half-dead service that no
+    // restart policy can notice. `&mut` on the handles keeps the tasks alive for
+    // the branches that do not fire.
+    let mut failure: Option<&str> = None;
     tokio::select! {
         result = server.clone().run(im_rx, &mut monitor_rx) => {
-            if let Err(e) = result {
-                tracing::error!("Server exited with error: {e}");
+            match result {
+                Err(e) => {
+                    tracing::error!("Server loop failed: {e}");
+                    failure = Some("server loop failed");
+                }
+                Ok(()) => {
+                    tracing::error!("Server loop ended — both event channels are closed");
+                    failure = Some("server loop ended");
+                }
             }
+        }
+        _ = &mut im_handle => {
+            tracing::error!("IM adapter ended — atim can no longer receive messages");
+            failure = Some("IM adapter ended");
+        }
+        _ = &mut monitor_handle => {
+            tracing::error!("Session monitor ended — agent output will not be relayed");
+            failure = Some("session monitor ended");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received interrupt signal, shutting down...");
@@ -470,8 +493,16 @@ async fn main() -> anyhow::Result<()> {
     im_handle.abort();
     monitor_handle.abort();
 
-    // Kill tmux session unless keep_running is set
-    if !tmux_keep_running {
+    // Tear tmux down only on a shutdown the user asked for. On the failure path
+    // the service manager is about to start us again, and the next instance
+    // re-adopts the existing windows from the stored bindings — killing them
+    // here would turn a crash loop into losing every agent the user was in.
+    if failure.is_some() {
+        tracing::warn!(
+            "Keeping tmux session '{}' alive for the restart",
+            tmux_session_name
+        );
+    } else if !tmux_keep_running {
         tracing::info!("Killing tmux session '{}'...", tmux_session_name);
         let _ = tokio::process::Command::new("tmux")
             .args(["kill-session", "-t", &tmux_session_name])
@@ -479,6 +510,12 @@ async fn main() -> anyhow::Result<()> {
             .await;
     } else {
         tracing::info!("Keeping tmux session '{}' alive", tmux_session_name);
+    }
+
+    if let Some(what) = failure {
+        // Non-zero, so this is a failure the service manager restarts even if
+        // it is only configured for `Restart=on-failure`.
+        return Err(anyhow::anyhow!("{what}"));
     }
 
     Ok(())

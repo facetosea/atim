@@ -361,8 +361,13 @@ fn install_service_windows() -> Result<(), Box<dyn std::error::Error>> {
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
     <RestartOnFailure>
+      <!-- Retry without a practical ceiling: the scheduler gives up after
+           Count attempts, and atim has to come back however long the failure
+           lasts. Task Scheduler has no "unlimited", so this is a large bound.
+           It only fires on a non-zero exit, which is now every unexpected
+           ending — atim exits 0 only for a shutdown the user asked for. -->
       <Interval>PT1M</Interval>
-      <Count>3</Count>
+      <Count>9999</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
@@ -590,12 +595,19 @@ fn install_service(system_level: bool) -> Result<(), Box<dyn std::error::Error>>
 Description=Atim - AI Agent Through IM
 After=network-online.target
 Wants=network-online.target
+# Retry without a ceiling. The default (5 starts per 10s) makes systemd give up
+# on a crash loop: the unit goes to `failed` and then refuses to start again
+# until someone runs `systemctl reset-failed`. 0 disables the rate limit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 KillMode=process
 ExecStart={}
-Restart=on-failure
+# `always`, not `on-failure`. atim exits 0 when a component it depends on dies,
+# and `on-failure` would leave the service stopped after exactly the failure it
+# most needs to recover from.
+Restart=always
 RestartSec=5
 TimeoutStopSec=10
 EnvironmentFile=-~/.atim/.env
