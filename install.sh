@@ -463,14 +463,41 @@ start_user_service_if_requested() {
     fi
   fi
 
-  if is_truthy "$start_mode"; then
-    info "Starting user-level atim.service ..."
-    systemctl --user start atim.service
-  elif is_falsy "$start_mode"; then
+  if is_falsy "$start_mode"; then
     info "Skipped starting service. Run: systemctl --user start atim.service"
-  else
+    return
+  fi
+
+  if ! is_truthy "$start_mode"; then
     err "invalid ATIM_START_SERVICE value: ${ATIM_START_SERVICE} (expected ask/true/false)"
     exit 1
+  fi
+
+  # A unit that tripped systemd's start limit is left in `failed` and then
+  # refuses to start at all -- "start of the service was attempted too often"
+  # -- until it is reset. Clear that first, or a reinstall cannot recover the
+  # very failure it exists to repair.
+  systemctl --user reset-failed atim.service 2>/dev/null || true
+
+  info "Starting user-level atim.service ..."
+  # Worth reporting, not worth aborting: the binary and the config are already
+  # in place, and the service can still be started by hand afterwards. Aborting
+  # here would report a successful install as a failed one.
+  if ! systemctl --user start atim.service; then
+    err "atim.service did not start. The install itself finished; check it with:"
+    err "  systemctl --user status atim.service"
+    err "  journalctl --user -u atim.service -n 50"
+    return
+  fi
+
+  # `start` returns as soon as the job is queued, so confirm it actually came up
+  # rather than reporting success over a unit that exited immediately.
+  sleep 1
+  if systemctl --user is-active --quiet atim.service; then
+    info "atim.service is running."
+  else
+    err "atim.service was started but is not active. Check:"
+    err "  journalctl --user -u atim.service -n 50"
   fi
 }
 
