@@ -450,6 +450,16 @@ enable_user_service() {
 
   info "Enabling user-level atim.service ..."
   systemctl --user enable atim.service
+
+  # A user service stops when its user logs out, unless linger is on. For an
+  # IM bridge that means atim dies the moment you close the terminal.
+  local linger_user="${USER:-$(whoami)}"
+  if loginctl enable-linger "$linger_user" 2>/dev/null; then
+    info "Linger enabled for '${linger_user}': the service keeps running after logout."
+  else
+    err "Could not enable linger for '${linger_user}'. The service stops at logout. Try:"
+    err "  sudo loginctl enable-linger ${linger_user}"
+  fi
 }
 
 start_user_service_if_requested() {

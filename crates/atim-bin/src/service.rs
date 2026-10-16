@@ -541,7 +541,60 @@ fn enable_service(system_level: bool) -> Result<(), Box<dyn std::error::Error>> 
     {
         std::process::exit(code);
     }
+
+    enable_linger(system_level);
     Ok(())
+}
+
+/// The current user, as `loginctl` wants it.
+#[cfg(not(windows))]
+fn current_user() -> Option<String> {
+    if let Ok(user) = std::env::var("USER")
+        && !user.trim().is_empty()
+    {
+        return Some(user.trim().to_string());
+    }
+    let out = Command::new("whoami").output().ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Keep the user service running after the user logs out.
+///
+/// Without linger systemd stops every service in the user manager at logout,
+/// and atim is exactly the kind of thing that has to keep running on a machine
+/// nobody is sitting at. System-level units run from boot and need none of
+/// this.
+#[cfg(not(windows))]
+fn enable_linger(system_level: bool) {
+    if system_level {
+        return;
+    }
+    let Some(user) = current_user() else {
+        eprintln!(
+            "Warning: could not tell which user to enable linger for.                    The service stops at logout. Run: loginctl enable-linger $USER"
+        );
+        return;
+    };
+
+    match Command::new("loginctl")
+        .args(["enable-linger", &user])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            println!(
+                "Linger enabled for '{}': the service keeps running after logout.",
+                user
+            );
+        }
+        _ => {
+            eprintln!(
+                "Warning: could not enable linger for '{}', so the service stops at \
+                 logout. Run it once as that user: loginctl enable-linger {user}",
+                user
+            );
+        }
+    }
 }
 
 #[cfg(not(windows))]
